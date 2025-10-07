@@ -27,6 +27,7 @@ HEADLESS = _env_flag('HEADLESS', '1')
 BLOCK_TRACKERS = _env_flag('BLOCK_TRACKERS', '1')
 BLOCK_MEDIA = _env_flag('BLOCK_MEDIA', '1')  # режем image/font/media
 SAVE_STATE = _env_flag('SAVE_STATE', '1')  # хранить state.json (куки и пр.)
+AUTO_RESURRECT = _env_flag('AUTO_RESURRECT', '1')  # автоматически жать «Воскресить», если герой мёртв
 
 STATE_PATH = Path(os.getenv('STATE_PATH', 'state.json'))
 
@@ -86,6 +87,14 @@ BAD_SELECTORS = [
     '#cntrl1 a.pun_link', '#cntrl a.pun_link', 'a.pun_link',
     'a:has-text("Сделать плохо")', 'button:has-text("Сделать плохо")',
     '[onclick*="punish"]', 'a[href*="punish"]',
+]
+RESURRECT_SELECTORS = [
+    'a:has-text("Воскресить")', 'button:has-text("Воскресить")',
+    'text=/Воскр/i',
+    '[onclick*="resur"]', '[href*="resur"]',
+    '[onclick*="reviv"]', '[href*="reviv"]',
+    'a:has-text("Resurrect")', 'button:has-text("Resurrect")',
+    'a:has-text("Revive")', 'button:has-text("Revive")',
 ]
 
 
@@ -231,18 +240,40 @@ async def ensure_logged_in(context, page, login, password) -> bool:
         if ok and SAVE_STATE:
             try:
                 await context.storage_state(path=str(STATE_PATH))
-                logging.info(f"Сессия сохранена в {STATE_PATH}")
+                logging.info(f"Session saved to {STATE_PATH}")
             except Exception as e:
-                logging.debug(f"Не удалось сохранить сессию: {e}")
+                logging.debug(f"Failed to save session: {e}")
         return ok
     return True
 
 
-# ===================== Клик по действию =====================
+# ===================== Воскресить и клик по действию =====================
+async def click_resurrect_if_needed(page) -> bool:
+    """Если видна кнопка 'Воскресить' — нажимаем и ждём восстановления контролов."""
+    loc, sel = await _first_visible(page, RESURRECT_SELECTORS)
+    if not loc:
+        return False
+    logging.info("Герой мёртв — жму «Воскресить».")
+    try:
+        await loc.click(timeout=CLICK_TIMEOUT_MS)
+        await asyncio.sleep(random.uniform(0.6, 1.2))
+        await wait_prana_controls(page, which='any', timeout_ms=5000)
+        logging.info("Воскрешение выполнено.")
+        return True
+    except Exception as e:
+        logging.warning(f"Не удалось нажать «Воскресить»: {e}")
+        return False
+
+
 async def click_prana_action(page) -> bool:
-    """Кликает good/bad по режиму. Возвращает True, если кликнули."""
+    """Кликает 'Воскресить' при необходимости, затем good/bad по режиму."""
     if "superhero" not in page.url:
         await page.goto(HERO_URL, wait_until="domcontentloaded")
+
+    if AUTO_RESURRECT:
+        resurrected = await click_resurrect_if_needed(page)
+        if resurrected:
+            return True
 
     which = 'any' if ACTION_MODE == 'random' else ACTION_MODE
     if not await wait_prana_controls(page, which=which, timeout_ms=DETECT_TIMEOUT_MS):
@@ -297,22 +328,31 @@ async def run_bot():
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=HEADLESS, args=launch_args)
+        import json
+
         context_kwargs = dict(
             user_agent=USER_AGENT,
             locale=LOCALE,
             viewport={"width": VIEWPORT_W, "height": VIEWPORT_H},
             extra_http_headers={"Accept-Language": f"{LOCALE},ru;q=0.9,en;q=0.8"},
         )
-        if SAVE_STATE and STATE_PATH.exists():
-            context_kwargs["storage_state"] = str(STATE_PATH)
+
+        if SAVE_STATE and STATE_PATH.exists() and STATE_PATH.stat().st_size > 2:
+            try:
+                with open(STATE_PATH, "r", encoding="utf-8") as f:
+                    state_obj = json.load(f)
+                context_kwargs["storage_state"] = state_obj
+                logging.info(f"Loaded storage state from {STATE_PATH}")
+            except Exception as e:
+                logging.warning(f"Failed to load storage state from {STATE_PATH}: {e}. Will login fresh.")
 
         context = await browser.new_context(**context_kwargs)
         await setup_routing(context)
 
-        # На всякий случай гасим любые диалоги/алерты
+        # Гасим диалоги: подтверждаем (важно для «Воскресить», если есть confirm)
         page = await context.new_page()
         page.set_default_timeout(20000)
-        page.on("dialog", lambda d: asyncio.create_task(d.dismiss()))
+        page.on("dialog", lambda d: asyncio.create_task(d.accept()))
 
         try:
             if not await ensure_logged_in(context, page, GODVILLE_LOGIN, GODVILLE_PASSWORD):
@@ -320,11 +360,11 @@ async def run_bot():
                 return
 
             logging.info(
-                f"Режим действий: {ACTION_MODE}{' + fallback' if ACTION_FALLBACK else ''}. Headless={HEADLESS}.")
+                f"Режим действий: {ACTION_MODE}{' + fallback' if ACTION_FALLBACK else ''}. Headless={HEADLESS}. AutoResurrect={AUTO_RESURRECT}.")
             miss_streak = 0
 
             while True:
-                # Пауза между действиями (минимальная для экономии CPU)
+                # Пауза между действиями (экономим CPU)
                 await asyncio.sleep(random.uniform(MIN_ACTION_INTERVAL_SEC, MAX_ACTION_INTERVAL_SEC))
 
                 # Если разлогинило — перелогин
@@ -333,7 +373,7 @@ async def run_bot():
                         logging.error("Перелогин не удался. Завершаю.")
                         return
 
-                # Периодически подстраховываемся лёгким обновлением, но не каждую итерацию
+                # Периодические подстраховки
                 if miss_streak == RELOAD_ON_MISS:
                     try:
                         await page.reload(wait_until="domcontentloaded")
@@ -361,7 +401,7 @@ async def run_bot():
                     continue
 
                 if miss_streak >= NO_BUTTONS_GRACE_CHECKS:
-                    # Кажется, прану потратили — уходим в сон
+                    # Вероятно, прану потратили/действий нет — сон
                     nap = random.uniform(SLEEP_MIN_SEC, SLEEP_MAX_SEC)
                     logging.info(f"Кнопок нет {miss_streak} раз подряд — сон на {nap / 60:.0f} мин.")
                     miss_streak = 0
