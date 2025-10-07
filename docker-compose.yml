@@ -1,0 +1,24 @@
+services:
+  godville-bot:
+    build: .
+    container_name: godville-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - HEADLESS=1
+      - BLOCK_MEDIA=1
+      - BLOCK_TRACKERS=1
+      - SAVE_STATE=1
+      - STATE_PATH=/app/data/state.json
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./data:/app/data
+    shm_size: "256m"
+    mem_limit: 256m
+    cpus: 0.30
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "3"
